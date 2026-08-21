@@ -11,3 +11,4 @@ Release notes and development milestones.
 - [2026-08-21 17:28] fix(audio): resolve audio frame drop during concurrent model inference evaluation
 - [2026-08-21 18:46] feat(export): export comprehensive model benchmark report with statistical variance
 - [2026-08-21 20:04] test(eval): assert scoring convergence across multi-turn reasoning transcripts
+- [2026-08-21 21:22] style(metrics): render interactive latency and accuracy trade-off Pareto frontiers
