@@ -16,3 +16,4 @@ Release notes and development milestones.
 - [2026-08-22 10:56] feat(telemetry): add real-time WebRTC audio stream telemetry gauge
 - [2026-08-22 12:24] feat(rca): build automated root-cause-analysis failure classifier module
 - [2026-08-22 13:52] perf(cache): memoize high-dimensional vector embeddings with local vector storage
+- [2026-08-22 15:20] feat(dashboard): design Next.js 15 app router dashboard with Tailwind CSS
