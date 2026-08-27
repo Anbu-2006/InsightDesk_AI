@@ -52,3 +52,4 @@ Release notes and development milestones.
 - [2026-08-25 21:07] feat(export): export comprehensive model benchmark report with statistical variance
 - [2026-08-25 21:48] test(eval): assert scoring convergence across multi-turn reasoning transcripts
 - [2026-08-27 09:27] style(metrics): render interactive latency and accuracy trade-off Pareto frontiers
+- [2026-08-27 10:54] feat(ensemble): implement JRH ensemble evaluation engine for reasoning models
