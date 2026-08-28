@@ -68,3 +68,4 @@ Release notes and development milestones.
 - [2026-08-28 15:51] perf(cache): memoize high-dimensional vector embeddings with local vector storage
 - [2026-08-28 17:10] feat(dashboard): design Next.js 15 app router dashboard with Tailwind CSS
 - [2026-08-28 18:29] feat(steering): add runtime prompt steering and dynamic context compression
+- [2026-08-28 19:48] fix(audio): resolve audio frame drop during concurrent model inference evaluation
