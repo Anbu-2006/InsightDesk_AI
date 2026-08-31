@@ -100,3 +100,4 @@ Release notes and development milestones.
 - [2026-08-31 14:27] feat(steering): add runtime prompt steering and dynamic context compression
 - [2026-08-31 15:28] fix(audio): resolve audio frame drop during concurrent model inference evaluation
 - [2026-08-31 16:30] feat(export): export comprehensive model benchmark report with statistical variance
+- [2026-08-31 17:31] test(eval): assert scoring convergence across multi-turn reasoning transcripts
