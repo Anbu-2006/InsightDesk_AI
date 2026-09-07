@@ -149,3 +149,4 @@ Release notes and development milestones.
 - [2026-09-07 18:27] feat(dashboard): design Next.js 15 app router dashboard with Tailwind CSS
 - [2026-09-07 18:57] feat(steering): add runtime prompt steering and dynamic context compression
 - [2026-09-07 19:26] fix(audio): resolve audio frame drop during concurrent model inference evaluation
+- [2026-09-07 19:55] feat(export): export comprehensive model benchmark report with statistical variance
