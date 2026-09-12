@@ -197,3 +197,4 @@ Release notes and development milestones.
 - [2026-09-10 18:27] feat(rca): build automated root-cause-analysis failure classifier module
 - [2026-09-10 19:44] perf(cache): memoize high-dimensional vector embeddings with local vector storage
 - [2026-09-10 21:01] feat(dashboard): design Next.js 15 app router dashboard with Tailwind CSS
+- [2026-09-12 09:43] feat(steering): add runtime prompt steering and dynamic context compression
