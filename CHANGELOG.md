@@ -203,3 +203,4 @@ Release notes and development milestones.
 - [2026-09-12 12:53] test(eval): assert scoring convergence across multi-turn reasoning transcripts
 - [2026-09-12 13:56] style(metrics): render interactive latency and accuracy trade-off Pareto frontiers
 - [2026-09-12 15:00] feat(ensemble): implement JRH ensemble evaluation engine for reasoning models
+- [2026-09-12 16:03] feat(telemetry): add real-time WebRTC audio stream telemetry gauge
