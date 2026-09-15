@@ -1,0 +1,526 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# InsightDesk AI — RAGless Reasoning Engine
+# The "Mind" of the platform.  Implements an agentic Think → Act → Observe
+# loop that executes backend tools (via MCP) instead of merely summarizing
+# retrieved documents.
+#
+# Architecture:
+#   • RAGless — the agent reasons from parametric knowledge + live tool calls.
+#   • Tool-aware — dynamically discovers MCP tools and selects the best one.
+#   • Self-correcting — re-plans when an action fails or confidence drops.
+#   • Tiered Memory — working / episodic / persistent hierarchy.
+#
+# Targets: 80 % autonomous resolution · 98 % groundedness · near-zero hallucination
+# ──────────────────────────────────────────────────────────────────────────────
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+# ── Resolve imports ──────────────────────────────────────────────────────────
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+from schemas.reasoning import (
+    ActionOutput,
+    ActionType,
+    AgentExecutionState,
+    MemoryTier,
+    ThoughtStep,
+    ToolInvocation,
+)
+from mcp_client import MCPClientError, MCPRegistry
+from llm_provider import MultiProviderRouter
+
+logger = logging.getLogger("insightdesk.engine")
+
+# Maximum reasoning steps before the agent must yield a final answer.
+MAX_REASONING_STEPS = 12
+
+# Confidence threshold — below this the agent self-corrects or escalates.
+CONFIDENCE_FLOOR = 0.70
+
+# If accuracy drops below this, flag the session for hallucination review.
+HALLUCINATION_THRESHOLD = 0.60
+
+
+class ReasoningEngine:
+    """
+    Core agentic reasoning loop.
+
+    The engine receives a user query, plans a sequence of actions, executes
+    them through MCP tool calls, observes the results, and either continues
+    reasoning or returns a final resolution.
+
+    This is a *RAGless* architecture: the agent does **not** retrieve chunks
+    from a vector store.  Instead it relies on:
+      1. Its parametric knowledge (model weights).
+      2. Live tool calls via MCP to ground answers in real enterprise data.
+      3. A tiered memory system for multi-turn context.
+    """
+
+    def __init__(self, mcp_registry: MCPRegistry) -> None:
+        self.mcp = mcp_registry
+        self._episodic_memory: List[Dict[str, Any]] = []
+        self.router = MultiProviderRouter()
+        
+        # ── Configuration State ──────────────────────────────────────────────
+        self.config = {
+            "source_type": os.getenv("WORKER_SOURCE", "INTERNAL_DEMO"),
+            "remote_url": None,
+            "local_path": None,
+            "api_key": None
+        }
+
+    def get_config(self) -> Dict[str, Any]:
+        """Return current configuration."""
+        return self.config
+
+    def update_config(self, source_type: str, remote_url: Optional[str] = None, 
+                      local_path: Optional[str] = None, api_key: Optional[str] = None) -> None:
+        """Update active worker source and settings."""
+        self.config.update({
+            "source_type": source_type,
+            "remote_url": remote_url,
+            "local_path": local_path,
+            "api_key": api_key
+        })
+        logger.info("Worker configuration updated to source: %s", source_type)
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    async def resolve(self, query: str) -> AgentExecutionState:
+        """
+        Main entry point.  Accepts a natural-language enterprise query and
+        returns a fully-traced execution state with the resolution.
+        """
+        session_id = str(uuid.uuid4())
+        
+        # Determine current model based on router config
+        provider = self.router.provider
+        model_map = {"gemini": "gemini-2.5-flash", "groq": "llama3-70b-8192", "nvidia": "meta/llama-3.1-70b-instruct"}
+        model = model_map.get(provider, "deterministic-mock")
+        
+        state = AgentExecutionState(
+            session_id=session_id, 
+            query=query,
+            generator_provider=provider,
+            generator_model=model
+        )
+        t0 = time.perf_counter()
+
+        logger.info("Session %s — resolving via %s: %s", session_id, self.config["source_type"], query)
+
+        # ── Route based on Source Type ───────────────────────────────────────
+        if self.config["source_type"] == "EXTERNAL_URL":
+            return await self._call_external_api(query, state, t0)
+        
+        if self.config["source_type"] == "LOCAL_FOLDER":
+            return await self._call_local_module(query, state, t0)
+
+        # DEFAULT: INTERNAL_DEMO (The existing reasoning loop below)
+        for step_idx in range(MAX_REASONING_STEPS):
+            # ── THINK ────────────────────────────────────────────────────────
+            thought = await self._think(state, step_idx)
+            state.steps.append(thought)
+
+            # ── DECIDE: final answer or continue? ────────────────────────────
+            if thought.action_type == ActionType.RESPONSE:
+                state.final_resolution = thought.action_input.get("answer", "")
+                state.autonomous_resolution = True
+                break
+
+            # ── ACT ──────────────────────────────────────────────────────────
+            if thought.action_type == ActionType.TOOL_CALL:
+                invocation = await self._act(thought)
+                state.tool_calls.append(invocation)
+
+                # Inject observation back into the thought
+                thought.observation = self._summarize_tool_result(invocation)
+
+                # ── SELF-CORRECT on failure ──────────────────────────────────
+                if not invocation.success and thought.confidence < CONFIDENCE_FLOOR:
+                    correction = self._self_correct(state, step_idx, invocation)
+                    state.steps.append(correction)
+
+            elif thought.action_type == ActionType.MEMORY_UPDATE:
+                self._update_memory(thought)
+
+        # ── Finalize telemetry ───────────────────────────────────────────────
+        state.total_latency_ms = (time.perf_counter() - t0) * 1000
+        state.accuracy_score = self._compute_accuracy(state)
+        state.hallucination_flag = state.accuracy_score < HALLUCINATION_THRESHOLD
+
+        if not state.final_resolution:
+            state.final_resolution = (
+                "I was unable to fully resolve this query autonomously. "
+                "Escalating to a human agent."
+            )
+            state.autonomous_resolution = False
+
+        # Persist to episodic memory
+        self._episodic_memory.append({
+            "session_id": session_id,
+            "query": query,
+            "resolved": state.autonomous_resolution,
+            "steps": len(state.steps),
+        })
+
+        logger.info(
+            "Session %s — resolved=%s steps=%d latency=%.0f ms accuracy=%.2f",
+            session_id,
+            state.autonomous_resolution,
+            len(state.steps),
+            state.total_latency_ms,
+            state.accuracy_score,
+        )
+        return state
+
+    # ── THINK — Chain-of-Thought Reasoning ───────────────────────────────────
+
+    async def _think(
+        self,
+        state: AgentExecutionState,
+        step_idx: int,
+    ) -> ThoughtStep:
+        """
+        Produce the next reasoning step.
+
+        In a production system this calls the LLM (Gemini 2.0 Flash) with:
+          • The user query
+          • Available MCP tools (as a function-calling schema)
+          • Prior steps + observations (the reasoning trace)
+
+        For this implementation, we build the prompt and demonstrate the
+        structured output contract.  The LLM integration point is clearly
+        marked for plug-in.
+        """
+        available_tools = self.mcp.available_tools()
+        prior_observations = [
+            s.observation for s in state.steps if s.observation
+        ]
+
+        # ── Build the agentic prompt ─────────────────────────────────────────
+        system_prompt = self._build_system_prompt(available_tools)
+        user_context = self._build_user_context(state.query, prior_observations)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # 🔌 LLM INTEGRATION POINT
+        # Calls the active LLM provider (Gemini or Groq) using the newly built
+        # MultiProviderRouter. If no keys are set, it falls back to the deterministic route.
+        # ─────────────────────────────────────────────────────────────────────
+
+        thought = await self.router.generate_thought(
+            system_prompt=system_prompt,
+            user_context=user_context,
+            tools=available_tools,
+            step_idx=step_idx,
+            state_query=state.query,
+            mock_fallback=lambda idx, t: self._deterministic_route(state, idx, t)
+        )
+        return thought
+
+    # ── ACT — Execute MCP Tool Calls ─────────────────────────────────────────
+
+    async def _act(self, thought: ThoughtStep) -> ToolInvocation:
+        """Execute the tool call decided during the THINK phase."""
+        tool_name = thought.action_input.get("tool", "")
+        arguments = thought.action_input.get("arguments", {})
+
+        invocation = ToolInvocation(tool_name=tool_name, arguments=arguments)
+        t0 = time.perf_counter()
+
+        try:
+            result = await self.mcp.call_tool(tool_name, arguments)
+            invocation.latency_ms = (time.perf_counter() - t0) * 1000
+            invocation.success = not result.isError
+
+            # Extract text content from the MCP response
+            texts = [cb.text for cb in result.content if cb.text]
+            invocation.result = "\n".join(texts) if texts else None
+
+            if result.isError:
+                invocation.error = invocation.result
+
+        except MCPClientError as exc:
+            invocation.latency_ms = (time.perf_counter() - t0) * 1000
+            invocation.success = False
+            invocation.error = str(exc)
+            logger.warning("Tool [%s] failed: %s", tool_name, exc)
+
+        return invocation
+
+    # ── SELF-CORRECT — Recover from Failures ─────────────────────────────────
+
+    def _self_correct(
+        self,
+        state: AgentExecutionState,
+        step_idx: int,
+        failed_invocation: ToolInvocation,
+    ) -> ThoughtStep:
+        """
+        When a tool call fails and confidence is low, the engine generates
+        a self-correction step that re-plans the approach.
+        """
+        return ThoughtStep(
+            step_index=step_idx + 1,
+            thinking=(
+                f"Tool '{failed_invocation.tool_name}' failed with: "
+                f"{failed_invocation.error}. "
+                f"Re-evaluating approach. Will attempt alternative tool or "
+                f"provide a partial answer with appropriate caveats."
+            ),
+            action_type=ActionType.SELF_CORRECT,
+            action_input={
+                "failed_tool": failed_invocation.tool_name,
+                "error": failed_invocation.error,
+                "strategy": "retry_with_alternative",
+            },
+            confidence=0.5,
+        )
+
+    # ── Memory Management ────────────────────────────────────────────────────
+
+    def _update_memory(self, thought: ThoughtStep) -> None:
+        """Persist a memory delta from a MEMORY_UPDATE thought step."""
+        if thought.action_input:
+            self._episodic_memory.append(thought.action_input)
+            logger.debug("Episodic memory updated: %s", thought.action_input)
+
+    # ── Prompt Construction ──────────────────────────────────────────────────
+
+    def _build_system_prompt(self, tools: List[str]) -> str:
+        """Build the system prompt for the RAGless reasoning agent."""
+        tool_list = "\n".join(f"  • {t}" for t in tools) if tools else "  (none)"
+        return (
+            "You are the Core Intelligence agent for InsightDesk AI, a 2026-tier "
+            "Quality Orchestration platform.\n\n"
+            "YOUR MANDATE:\n"
+            "  1. You must EXECUTE backend actions — not merely summarize text.\n"
+            "  2. You have access to enterprise tools via MCP. Use them.\n"
+            "  3. You must achieve 98% groundedness. Never fabricate data.\n"
+            "  4. If you lack information, call the appropriate tool.\n"
+            "  5. If a tool fails, self-correct and try an alternative.\n\n"
+            f"AVAILABLE TOOLS:\n{tool_list}\n\n"
+            "RESPONSE FORMAT:\n"
+            "  Return a structured ThoughtStep with your reasoning chain, "
+            "the action you chose, and your confidence score."
+        )
+
+    def _build_user_context(
+        self,
+        query: str,
+        observations: List[str],
+    ) -> str:
+        """Assemble the user-facing context including prior observations."""
+        parts = [f"USER QUERY: {query}"]
+        if observations:
+            parts.append("PRIOR OBSERVATIONS:")
+            for i, obs in enumerate(observations, 1):
+                parts.append(f"  [{i}] {obs}")
+        return "\n".join(parts)
+
+    # ── Deterministic Routing (Pre-LLM Placeholder) ──────────────────────────
+
+    def _deterministic_route(
+        self,
+        state: AgentExecutionState,
+        step_idx: int,
+        tools: List[str],
+    ) -> ThoughtStep:
+        """
+        Rule-based routing that demonstrates the Think → Act → Observe
+        contract before an LLM is plugged in.
+
+        Routes by keyword analysis:
+          • SQL / database / billing → sql_query tool
+          • Notion / document / page → notion_search tool
+          • Otherwise → direct response
+        """
+        q = state.query.lower()
+
+        if step_idx > 0 and state.steps[-1].action_type == ActionType.TOOL_CALL:
+            # We already acted — now synthesize the answer
+            last_obs = state.steps[-1].observation or "No observation available."
+            return ThoughtStep(
+                step_index=step_idx,
+                thinking=(
+                    f"I received tool output: '{last_obs[:200]}'. "
+                    f"Synthesizing final answer from this data."
+                ),
+                action_type=ActionType.RESPONSE,
+                action_input={"answer": f"Based on enterprise data: {last_obs}"},
+                confidence=0.92,
+            )
+
+        if any(kw in q for kw in ("sql", "database", "billing", "subscription", "invoice")):
+            if "sql_query" in tools:
+                return ThoughtStep(
+                    step_index=step_idx,
+                    thinking=(
+                        "The query involves transactional data. I should query "
+                        "the enterprise SQL database via the sql_query MCP tool "
+                        "to get grounded, real-time information."
+                    ),
+                    action_type=ActionType.TOOL_CALL,
+                    action_input={
+                        "tool": "sql_query",
+                        "arguments": {"query": self._derive_sql(state.query)},
+                    },
+                    confidence=0.88,
+                )
+
+        if any(kw in q for kw in ("notion", "document", "page", "wiki", "knowledge")):
+            if "notion_search" in tools:
+                return ThoughtStep(
+                    step_index=step_idx,
+                    thinking=(
+                        "The query references documentation. I should search "
+                        "Notion via the notion_search MCP tool."
+                    ),
+                    action_type=ActionType.TOOL_CALL,
+                    action_input={
+                        "tool": "notion_search",
+                        "arguments": {"query": state.query},
+                    },
+                    confidence=0.85,
+                )
+
+        # Default: respond directly from parametric knowledge
+        return ThoughtStep(
+            step_index=step_idx,
+            thinking=(
+                "This query can be answered from my existing knowledge. "
+                "No external tool call is required."
+            ),
+            action_type=ActionType.RESPONSE,
+            action_input={
+                "answer": (
+                    "I've analyzed your request using internal reasoning. "
+                    "For queries requiring live enterprise data, I can also "
+                    "query your SQL databases and Notion workspace via MCP."
+                ),
+            },
+            confidence=0.80,
+        )
+
+    def _derive_sql(self, query: str) -> str:
+        """
+        Derive a safe SQL query from natural language.
+        In production, this is handled by the LLM with guardrails.
+        """
+        q = query.lower()
+        if "billing" in q or "invoice" in q:
+            return "SELECT * FROM billing_records ORDER BY created_at DESC LIMIT 10"
+        if "subscription" in q:
+            return "SELECT * FROM subscriptions WHERE status = 'active' LIMIT 10"
+        return "SELECT 1 AS health_check"
+
+    # ── Accuracy Computation ─────────────────────────────────────────────────
+
+    def _compute_accuracy(self, state: AgentExecutionState) -> float:
+        """
+        Compute a groundedness / accuracy score for the session.
+        In production, this is validated by the JRH (Judge Reliability Harness)
+        on the platform-infra side.
+        """
+        if not state.steps:
+            return 0.0
+
+        grounded_steps = sum(
+            1 for s in state.steps
+            if s.confidence >= CONFIDENCE_FLOOR
+            and s.action_type in (ActionType.TOOL_CALL, ActionType.RESPONSE)
+        )
+        return min(grounded_steps / len(state.steps), 1.0)
+
+    # ── Telemetry ────────────────────────────────────────────────────────────
+
+    # ── External Worker Support ─────────────────────────────────────────────
+
+    async def _call_external_api(self, query: str, state: AgentExecutionState, t0: float) -> AgentExecutionState:
+        """Call a customer's API URL as the worker."""
+        import httpx
+        url = self.config["remote_url"]
+        if not url:
+            state.final_resolution = "ERROR: External URL source selected but no URL provided."
+            return state
+
+        logger.info("Calling external API: %s", url)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = {"Authorization": f"Bearer {self.config['api_key']}"} if self.config["api_key"] else {}
+                resp = await client.post(url, json={"query": query}, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                
+                state.final_resolution = data.get("resolution", data.get("answer", "No resolution found in API response."))
+                state.autonomous_resolution = True
+                
+                # Mock a single thought step to represent the API call
+                state.steps.append(ThoughtStep(
+                    step_index=0,
+                    thinking=f"Delegated query to external API: {url}",
+                    action_type=ActionType.RESPONSE,
+                    action_input={"api_response": data},
+                    confidence=0.95
+                ))
+        except Exception as e:
+            state.final_resolution = f"External API Error: {str(e)}"
+            state.autonomous_resolution = False
+
+        state.total_latency_ms = (time.perf_counter() - t0) * 1000
+        return state
+
+    async def _call_local_module(self, query: str, state: AgentExecutionState, t0: float) -> AgentExecutionState:
+        """Dynamically load and call a customer's local Python code."""
+        import importlib.util
+        path = self.config["local_path"]
+        if not path or not os.path.exists(path):
+            state.final_resolution = f"ERROR: Local path '{path}' not found."
+            return state
+
+        logger.info("Loading local module: %s", path)
+        try:
+            # 1. Load the module
+            spec = importlib.util.spec_from_file_location("custom_worker", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            # 2. Call resolve() function or Worker class
+            # We expect a function: resolve(query: str) -> str
+            if hasattr(module, "resolve"):
+                if hasattr(module.resolve, "__code__") and module.resolve.__code__.co_flags & 0x80: # async
+                    result = await module.resolve(query)
+                else:
+                    result = module.resolve(query)
+                state.final_resolution = str(result)
+            else:
+                state.final_resolution = "ERROR: Local module does not contain a 'resolve(query)' function."
+            
+            state.autonomous_resolution = True
+            state.steps.append(ThoughtStep(
+                step_index=0,
+                thinking=f"Executed local Python logic from: {path}",
+                action_type=ActionType.RESPONSE,
+                action_input={"local_path": path},
+                confidence=0.98
+            ))
+        except Exception as e:
+            state.final_resolution = f"Local Logic Error: {str(e)}"
+            state.autonomous_resolution = False
+
+        state.total_latency_ms = (time.perf_counter() - t0) * 1000
+        return state
+
+    def _summarize_tool_result(self, invocation: ToolInvocation) -> str:
+        """Create a concise observation string from a tool invocation."""
+        if invocation.success:
+            result_str = str(invocation.result or "")
+            return result_str[:500] if len(result_str) > 500 else result_str
+        return f"ERROR: {invocation.error}"
+

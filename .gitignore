@@ -1,0 +1,56 @@
+# ──────────────────────────────────────────────────────────
+# InsightDesk AI — Monorepo .gitignore
+# ──────────────────────────────────────────────────────────
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.installed.cfg
+
+# Virtual Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Databases
+*.db
+*.sqlite
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# Build artifacts
+build/
+dist/
+*.map
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
